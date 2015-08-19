@@ -9,7 +9,6 @@ module Fluent
       super
 
       require 'csv'
-      @line_number = 0
       @first_keys = []
       @second_keys = []
       @data_array = []
@@ -29,31 +28,21 @@ module Fluent
     def configure(conf)
       super
 
-      @command = "#{@dstat_path} #{@option} --output #{@tmp_file} #{@delay}"
+      @command = "#{@dstat_path} #{@option} --output #{@tmp_file} #{@delay} 0"
       @hostname = `#{@hostname_command}`.chomp!
-    end
-
-    def check_dstat
-      restart if (Time.now - @last_time) > @delay*3
     end
 
     def start
       touch_or_truncate(@tmp_file)
-      @io = IO.popen(@command, "r")
-      @pid = @io.pid
 
       @loop = Coolio::Loop.new
-      @dw = DstatCSVWatcher.new(@tmp_file, &method(:receive_lines))
+      @dw = &method(:receive_lines)
       @dw.attach(@loop)
-      @tw = TimerWatcher.new(1, true,  &method(:check_dstat))
-      @tw.attach(@loop)
       @thread = Thread.new(&method(:run))
     end
 
     def shutdown
-      Process.kill(:TERM, @pid)
       @dw.detach
-      @tw.detach
       @loop.stop
       @thread.join
       File.delete(@tmp_file)
@@ -69,19 +58,11 @@ module Fluent
     end
 
     def restart
-      Process.detach(@pid)
-      Process.kill(:TERM, @pid)
       @dw.detach
-      @tw.detach
-      @line_number = 0
       touch_or_truncate(@tmp_file)
 
-      @io = IO.popen(@command, "r")
-      @pid = @io.pid
-      @dw = DstatCSVWatcher.new(@tmp_file, &method(:receive_lines))
+      @dw = &method(:receive_lines)
       @dw.attach(@loop)
-      @tw = TimerWatcher.new(1, true,  &method(:check_dstat))
-      @tw.attach(@loop)
     end
 
     def touch_or_truncate(file)
@@ -92,7 +73,14 @@ module Fluent
       end
     end
 
-    def receive_lines(lines)
+    def receive_lines
+      `#{@command}`
+      @line_number = 0
+      lines = []
+      while line = File.open(@tmp_file).slice!(/.*?\n/m)
+        lines << line.chomp
+      end
+
       lines.each do |line|
         next if line == ""
         case @line_number
@@ -132,56 +120,12 @@ module Fluent
           router.emit(emit_tag, Engine.now, record)
         end
 
-        if (@line_number % @max_lines) == (@max_lines - 1)
-          @dw.detach
-          File.truncate(@tmp_file, 0)
-          @dw = DstatCSVWatcher.new(@tmp_file, &method(:receive_lines))
-          @dw.attach(@loop)
-        end
-
         @line_number += 1
         @last_time = Time.now
       end
 
+      touch_or_truncate(@tmp_file)
     end
 
-    class DstatCSVWatcher < Cool.io::StatWatcher
-      INTERVAL = 0.500
-      attr_accessor :previous, :cur
-
-      def initialize(path, &receive_lines)
-        super path, INTERVAL
-        @path = path
-        @io = File.open(path)
-        @pos = 0
-        @receive_lines = receive_lines
-      end
-
-      def on_change(prev, cur)
-        return if cur.size < @pos
-
-        buffer = @io.read(cur.size - @pos)
-        @pos = cur.size
-        lines = []
-        while line = buffer.slice!(/.*?\n/m)
-          lines << line.chomp
-        end
-        @receive_lines.call(lines)
-      end
-    end
-
-    class TimerWatcher < Coolio::TimerWatcher
-      def initialize(interval, repeat, &check_dstat)
-        @check_dstat = check_dstat
-        super(interval, repeat)
-      end
-
-      def on_timer
-        @check_dstat.call
-      rescue
-        $log.error $!.to_s
-        $log.error_backtrace
-      end
-    end
   end
 end
